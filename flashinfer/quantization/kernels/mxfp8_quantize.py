@@ -28,7 +28,7 @@ Key features:
 """
 
 import functools
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -43,6 +43,7 @@ from ...cute_dsl.fp4_common import (
     get_ptr_as_int64,
 )
 from ...cute_dsl.utils import get_num_sm
+from ..fp8_quantization import _check_mxfp8_out_buffers
 from ..quantization_cute_dsl_utils import (
     # Constants
     SF_VEC_SIZE,
@@ -1307,6 +1308,24 @@ def _get_compiled_kernel_mxfp8_swizzled(
     return compiled_kernel, kernel_obj.rows_per_block
 
 
+def _output_buffers(
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    m: int,
+    padded_k: int,
+    scale_size: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """uint8 views of caller-provided ``out`` buffers, or new ones."""
+    if out is None:
+        return (
+            torch.empty(m, padded_k, dtype=torch.uint8, device=device),
+            torch.empty(scale_size, dtype=torch.uint8, device=device),
+        )
+    _check_mxfp8_out_buffers(out, m, padded_k, scale_size, device)
+    q, sf = out
+    return q.view(torch.uint8).view(m, padded_k), sf.view(-1)
+
+
 @flashinfer_api
 def mxfp8_quantize_cute_dsl(
     input: torch.Tensor,
@@ -1314,6 +1333,7 @@ def mxfp8_quantize_cute_dsl(
     alignment: int = 32,
     enable_pdl: bool | None = None,
     is_sf_8x4_layout: bool = False,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to MXFP8 format using the CuTe-DSL kernel.
 
@@ -1343,6 +1363,11 @@ def mxfp8_quantize_cute_dsl(
     is_sf_8x4_layout : bool
         When ``is_sf_swizzled_layout`` is ``True``, selects 8x4 swizzling
         instead of the default 128x4.  Ignored for the linear layout.
+    out : Tuple[torch.Tensor, torch.Tensor], optional
+        ``(fp8_out, scale_out)`` buffers to write and return instead of
+        allocating: contiguous float8_e4m3fn (or uint8) with ``M * padded_K``
+        elements and last dimension ``padded_K``, and contiguous uint8 with
+        at least the scale-factor size of the chosen layout.
 
     Returns
     -------
@@ -1471,9 +1496,8 @@ def mxfp8_quantize_cute_dsl(
                 (padded_m + rows_per_block - 1) // rows_per_block, target_grid
             )
 
-        fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(
-            scale_output_size, dtype=torch.uint8, device=input.device
+        fp8_output, scale_output = _output_buffers(
+            out, m, padded_k, scale_output_size, input.device
         )
 
         kernel_fn(input_padded, fp8_output, scale_output, m, padded_m, num_blocks)
@@ -1490,13 +1514,14 @@ def mxfp8_quantize_cute_dsl(
             (total_sf_blocks + sf_blocks_per_tb - 1) // sf_blocks_per_tb, target_grid
         )
 
-        fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(
-            scale_output_size, dtype=torch.uint8, device=input.device
+        fp8_output, scale_output = _output_buffers(
+            out, m, padded_k, scale_output_size, input.device
         )
 
         kernel_fn(input_padded, fp8_output, scale_output, total_sf_blocks, num_blocks)
 
+    if out is not None:
+        return out
     fp8_tensor = fp8_output.view(torch.float8_e4m3fn)
 
     return fp8_tensor, scale_output

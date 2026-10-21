@@ -139,6 +139,78 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backen
         torch.cuda.synchronize()
 
 
+def _skip_unless_mxfp8_backend(backend: str) -> None:
+    if get_compute_capability(torch.device("cuda"))[0] < 10:
+        pytest.skip("mxfp8 quantization requires compute capability >= 10")
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+
+@pytest.mark.parametrize("m", [1, 37, 128, 300])
+@pytest.mark.parametrize("k", [768, 2048, 6144])
+@pytest.mark.parametrize(
+    "sf_layout", [SfLayout.layout_128x4, SfLayout.layout_linear, SfLayout.layout_8x4]
+)
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_out(m, k, sf_layout, backend):
+    """out=(x_q, sf) writes the given buffers, bit-exact with the allocating call."""
+    _skip_unless_mxfp8_backend(backend)
+    torch.manual_seed(m + k)
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda") * 3
+    ref_q, ref_sf = mxfp8_quantize(x, sf_swizzle_layout=sf_layout, backend=backend)
+    q = torch.full((m, k), 0x55, dtype=torch.uint8, device="cuda").view(
+        torch.float8_e4m3fn
+    )
+    # A larger scale buffer (e.g. sized for a bigger batch) is allowed; bytes past the
+    # layout's size must stay untouched.
+    sf = torch.full((ref_sf.numel() + 64,), 0xAB, dtype=torch.uint8, device="cuda")
+    got_q, got_sf = mxfp8_quantize(
+        x, sf_swizzle_layout=sf_layout, backend=backend, out=(q, sf)
+    )
+    assert got_q is q and got_sf is sf
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(sf[: ref_sf.numel()], ref_sf.view(-1))
+    assert bool((sf[ref_sf.numel() :] == 0xAB).all())
+
+
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_out_cuda_graph(backend):
+    """out= buffers are written in place on every graph replay."""
+    _skip_unless_mxfp8_backend(backend)
+    m, k = 64, 2048
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    q = torch.empty(m, k, dtype=torch.float8_e4m3fn, device="cuda")
+    sf = torch.empty(128 * (k // 32), dtype=torch.uint8, device="cuda")
+    mxfp8_quantize(x, backend=backend, out=(q, sf))  # compile outside capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mxfp8_quantize(x, backend=backend, out=(q, sf))
+    for _ in range(2):
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        torch.cuda.synchronize()
+        ref_q, ref_sf = mxfp8_quantize(x, backend=backend)
+        assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+        assert torch.equal(sf, ref_sf.view(-1))
+
+
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_out_validation(backend):
+    _skip_unless_mxfp8_backend(backend)
+    m, k = 4, 128
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    sf = torch.empty(128 * 4, dtype=torch.uint8, device="cuda")
+    q = torch.empty(m, k, dtype=torch.float8_e4m3fn, device="cuda")
+    with pytest.raises(ValueError, match="float8_e4m3fn or uint8"):
+        mxfp8_quantize(x, backend=backend, out=(q.view(torch.int8), sf))
+    with pytest.raises(ValueError, match="must hold"):
+        mxfp8_quantize(x, backend=backend, out=(q[:2], sf))
+    with pytest.raises(ValueError, match="uint8"):
+        mxfp8_quantize(x, backend=backend, out=(q, sf.view(torch.int8)))
+    with pytest.raises(ValueError, match="at least"):
+        mxfp8_quantize(x, backend=backend, out=(q, sf[:-1]))
+
+
 @pytest.mark.parametrize("batch_shape", [(1, 120, 64), (2, 128, 128), (3, 256, 160)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("backend", ["cuda", "cutile"])

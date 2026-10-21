@@ -65,6 +65,32 @@ def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
     return padded_row * padded_column
 
 
+def _check_mxfp8_out_buffers(
+    out: Tuple[torch.Tensor, torch.Tensor],
+    m: int,
+    padded_k: int,
+    scale_size: int,
+    device: torch.device,
+) -> None:
+    """Validate the caller-provided ``out=(x_q, sf)`` buffers of ``mxfp8_quantize``."""
+    x_q, sf = out
+    if x_q.dtype not in (torch.float8_e4m3fn, torch.uint8) or not x_q.is_contiguous():
+        raise ValueError("out[0] must be a contiguous float8_e4m3fn or uint8 tensor")
+    if x_q.numel() != m * padded_k or x_q.shape[-1] != padded_k:
+        raise ValueError(
+            f"out[0] must hold [{m}, {padded_k}] elements (K padded to alignment), "
+            f"got shape {tuple(x_q.shape)}"
+        )
+    if sf.dtype != torch.uint8 or not sf.is_contiguous():
+        raise ValueError("out[1] must be a contiguous uint8 tensor")
+    if sf.numel() < scale_size:
+        raise ValueError(
+            f"out[1] must hold at least {scale_size} scale factors, got {sf.numel()}"
+        )
+    if x_q.device != device or sf.device != device:
+        raise ValueError("out buffers must be on the input's device")
+
+
 @functools.cache
 def get_mxfp8_quantization_sm100_module():
     module = gen_mxfp8_quantization_sm100_module().build_and_load()
@@ -147,6 +173,34 @@ def get_mxfp8_quantization_sm100_module():
                 enable_pdl,
             )
             return out_val, out_sf
+
+    @register_custom_op(
+        "flashinfer::mxfp8_quantize_sm100_out",
+        mutates_args=("out_val", "out_sf"),
+    )
+    def mxfp8_quantize_sm100_out(
+        input: torch.Tensor,
+        out_val: torch.Tensor,
+        out_sf: torch.Tensor,
+        sf_swizzle_layout: int,
+        alignment: int,
+        enable_pdl: bool,
+    ) -> None:
+        """``mxfp8_quantize_sm100`` writing caller-provided (validated) buffers."""
+        module.mxfp8_quantize(
+            input, out_val, out_sf, sf_swizzle_layout, alignment, enable_pdl
+        )
+
+    @register_fake_op("flashinfer::mxfp8_quantize_sm100_out")
+    def _fake_mxfp8_quantize_sm100_out(
+        input: torch.Tensor,
+        out_val: torch.Tensor,
+        out_sf: torch.Tensor,
+        sf_swizzle_layout: int,
+        alignment: int,
+        enable_pdl: bool,
+    ) -> None:
+        pass
 
     @register_fake_op("flashinfer::mxfp8_quantize_sm100")
     def _fake_mxfp8_quantize_sm100(
@@ -253,6 +307,7 @@ def get_mxfp8_quantization_sm100_module():
     # Register the module
     return SimpleNamespace(
         mxfp8_quantize_sm100=mxfp8_quantize_sm100,
+        mxfp8_quantize_sm100_out=mxfp8_quantize_sm100_out,
         mxfp8_dequantize_host_sm100=mxfp8_dequantize_host_sm100,
         silu_and_mul_mxfp8_experts_quantize_sm100=silu_and_mul_mxfp8_experts_quantize_sm100,
         mxfp8_grouped_quant_sm100=mxfp8_grouped_quant_sm100,
@@ -267,6 +322,7 @@ def mxfp8_quantize(
     enable_pdl: Optional[bool] = None,
     backend: Literal["cuda", "cute-dsl"] = "cuda",
     sf_swizzle_layout: Optional[SfLayout] = None,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to MxFP8 format.
 
@@ -296,6 +352,14 @@ def mxfp8_quantize(
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
         ``is_sf_swizzled_layout``.
+    out : Tuple[torch.Tensor, torch.Tensor], optional
+        ``(x_q, sf)`` buffers to write and return instead of allocating new
+        ones, e.g. a consumer's preallocated input buffers. ``x_q`` is a
+        contiguous float8_e4m3fn (or uint8) tensor with ``M * padded_K``
+        elements and last dimension ``padded_K`` (``K`` rounded up to
+        ``alignment``); ``sf`` is a contiguous uint8 tensor with at least as
+        many elements as the allocating call returns for the chosen layout.
+        Both must be on the input's device. CUDA inputs only.
 
     Returns
     -------
@@ -342,11 +406,34 @@ def mxfp8_quantize(
             alignment=alignment,
             enable_pdl=enable_pdl,
             is_sf_8x4_layout=is_sf_8x4_layout_cute,
+            out=out,
         )
     else:
         # backend == "cuda"
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
+        if out is not None:
+            if not input.is_cuda:
+                raise ValueError("out is only supported for CUDA inputs")
+            m = input.numel() // input.shape[-1]
+            padded_k = (input.shape[-1] + alignment - 1) // alignment * alignment
+            if sf_swizzle_layout == SfLayout.layout_linear:
+                scale_size = m * padded_k // sf_vec_size
+            else:
+                row_size = 8 if sf_swizzle_layout == SfLayout.layout_8x4 else 128
+                scale_size = _compute_swizzled_layout_sf_size(
+                    m, padded_k // sf_vec_size, row_size
+                )
+            _check_mxfp8_out_buffers(out, m, padded_k, scale_size, input.device)
+            get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100_out(
+                input,
+                out[0],
+                out[1],
+                sf_swizzle_layout.value,
+                alignment,
+                enable_pdl,
+            )
+            return out
         x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
             input,
             sf_swizzle_layout,
