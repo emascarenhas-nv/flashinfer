@@ -809,6 +809,112 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
 
 #endif
 
+// UE8M0 biased exponent of ceil_pow2(value), saturated to [0, 254]. Bit-exact with
+// __nv_cvt_float_to_e8m0(value, __NV_SATFINITE, cudaRoundPosInf) and with FlashInfer's
+// CuTe-DSL mxfp8_quantize (float_to_ue8m0_fast).
+__device__ __forceinline__ uint32_t float_to_ue8m0_ceil(float value) {
+  if (value <= 0.f) {
+    return 0u;
+  }
+  uint32_t bits = __float_as_uint(value);
+  uint32_t exp_biased = (bits >> 23) & 0xffu;
+  uint32_t mantissa = bits & 0x7fffffu;
+  uint32_t bump = mantissa != 0u ? 1u : 0u;
+  if (exp_biased == 0u && mantissa <= 0x400000u) {
+    bump = 0u;
+  }
+  uint32_t result = exp_biased + bump;
+  return result > 254u ? 254u : result;
+}
+
+// Byte offset of MXFP8 scale factor (row, sf_col) in the LINEAR or SWIZZLED_128x4 layout.
+__device__ __forceinline__ int64_t mxfp8_sf_offset(int row, int sf_col, int num_sf_cols,
+                                                   QuantizationSFLayout layout) {
+  if (layout == QuantizationSFLayout::LINEAR) {
+    return static_cast<int64_t>(row) * num_sf_cols + sf_col;
+  }
+  // SWIZZLED_128x4: [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4 (kTile)]
+  int num_k_tiles = (num_sf_cols + 3) / 4;
+  return static_cast<int64_t>(row / 128) * num_k_tiles * 512 +
+         static_cast<int64_t>(sf_col / 4) * 512 + (row % 32) * 16 + ((row % 128) / 32) * 4 +
+         (sf_col % 4);
+}
+
+// MXFP8 quantization (E4M3 data, one UE8M0 scale per 32 elements) of one thread's VEC_SIZE
+// consecutive elements vals = x[row, col : col + VEC_SIZE), shared by the allreduce fusion kernels.
+//
+// The kMXFP8SFVecSize / VEC_SIZE threads holding one 32-element scale group must be consecutive,
+// lane-aligned lanes of one warp (col / VEC_SIZE == lane modulo the group size) and must call this
+// together; they reduce the group's amax with warp shuffles. Numerics match FlashInfer's
+// mxfp8_quantize (backend="cute-dsl") applied to the same bf16/fp16 values:
+// scale = ue8m0_ceil(amax * (1 / 448)), q = satfinite_rn(clamp(x * 2^-scale)).
+//
+// quant_out is [rows, hidden_dim] E4M3. scale_out holds the scales of every row; for the swizzled
+// layout the group leader of the last group also zeroes its row's column padding. Padding rows
+// [rows, round_up(rows, 128)) are left unwritten: a GEMM row only reads its own scales, so they
+// reach only output rows that are never stored.
+template <typename T, int VEC_SIZE>
+__device__ __forceinline__ void mxfp8_quantize_store(T const* vals, int row, int col,
+                                                     int hidden_dim, QuantizationSFLayout layout,
+                                                     void* quant_out, void* scale_out) {
+  constexpr int kSfVec = details::kMXFP8SFVecSize;
+  constexpr int kThreadsPerSf = kSfVec / VEC_SIZE;
+  static_assert(kSfVec % VEC_SIZE == 0 && kThreadsPerSf <= 32, "Invalid MXFP8 vector size");
+  static_assert(VEC_SIZE % 2 == 0, "MXFP8 packing converts element pairs");
+
+  float amax = 0.f;
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    amax = fmaxf(amax, fabsf(static_cast<float>(vals[i])));
+  }
+  constexpr unsigned int kGroupLanes =
+      kThreadsPerSf >= 32 ? 0xffffffffu : ((1u << kThreadsPerSf) - 1u);
+  unsigned int const mask = kGroupLanes << ((threadIdx.x & 31) & ~(kThreadsPerSf - 1));
+#pragma unroll
+  for (int offset = 1; offset < kThreadsPerSf; offset *= 2) {
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, offset));
+  }
+
+  constexpr float kInvE4M3Max = 1.0f / details::kFP8E4M3Max;
+  uint32_t sf = float_to_ue8m0_ceil(amax * kInvE4M3Max);
+  // 2^(127 - sf): exact inverse of the UE8M0 scale; 0 for sf == 0.
+  float inv_scale =
+      sf == 0u ? 0.f
+               : __uint_as_float(static_cast<uint32_t>(max(254 - static_cast<int>(sf), 0)) << 23);
+
+  using PackedQuantizedType = std::conditional_t<VEC_SIZE == 4, float, float2>;
+  static_assert(sizeof(PackedQuantizedType) == VEC_SIZE, "Unsupported MXFP8 vector size");
+  PackedQuantizedType ret;
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; i += 2) {
+    float2 f;
+    f.x = static_cast<float>(vals[i]) * inv_scale;
+    f.y = static_cast<float>(vals[i + 1]) * inv_scale;
+    f.x = fmaxf(fminf(f.x, details::kFP8E4M3Max), -details::kFP8E4M3Max);
+    f.y = fmaxf(fminf(f.y, details::kFP8E4M3Max), -details::kFP8E4M3Max);
+    reinterpret_cast<__nv_fp8x2_storage_t*>(&ret)[i / 2] =
+        __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
+  }
+  int64_t const elem_offset = static_cast<int64_t>(row) * hidden_dim + col;
+  *reinterpret_cast<PackedQuantizedType*>(reinterpret_cast<uint8_t*>(quant_out) + elem_offset) =
+      ret;
+
+  if ((col / VEC_SIZE) % kThreadsPerSf != 0) {
+    return;
+  }
+  uint8_t* sf_out = reinterpret_cast<uint8_t*>(scale_out);
+  int const num_sf_cols = hidden_dim / kSfVec;
+  int const sf_col = col / kSfVec;
+  sf_out[mxfp8_sf_offset(row, sf_col, num_sf_cols, layout)] = static_cast<uint8_t>(sf);
+  if (layout != QuantizationSFLayout::SWIZZLED_128x4 || sf_col != num_sf_cols - 1) {
+    return;
+  }
+  int const padded_cols = (num_sf_cols + 3) / 4 * 4;
+  for (int c = num_sf_cols; c < padded_cols; ++c) {
+    sf_out[mxfp8_sf_offset(row, c, num_sf_cols, layout)] = 0;
+  }
+}
+
 }  // namespace utils
 
 template <typename T, uint32_t VEC_SIZE>
@@ -1303,100 +1409,10 @@ class FusedOp {
   }
 
  protected:
-  // UE8M0 biased exponent of ceil_pow2(value), saturated to [0, 254]. Bit-exact with
-  // __nv_cvt_float_to_e8m0(value, __NV_SATFINITE, cudaRoundPosInf) and with FlashInfer's
-  // CuTe-DSL mxfp8_quantize (float_to_ue8m0_fast).
-  static __device__ __forceinline__ uint32_t float_to_ue8m0_ceil(float value) {
-    if (value <= 0.f) {
-      return 0u;
-    }
-    uint32_t bits = __float_as_uint(value);
-    uint32_t exp_biased = (bits >> 23) & 0xffu;
-    uint32_t mantissa = bits & 0x7fffffu;
-    uint32_t bump = mantissa != 0u ? 1u : 0u;
-    if (exp_biased == 0u && mantissa <= 0x400000u) {
-      bump = 0u;
-    }
-    uint32_t result = exp_biased + bump;
-    return result > 254u ? 254u : result;
-  }
-
-  // Byte offset of scale factor (row, sf_col) for MXFP8 (32-element vectors).
-  __device__ __forceinline__ int64_t mxfp8_sf_offset(int row, int sf_col, int num_sf_cols) const {
-    if (m_params.layout == QuantizationSFLayout::LINEAR) {
-      return static_cast<int64_t>(row) * num_sf_cols + sf_col;
-    }
-    // SWIZZLED_128x4: [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4 (kTile)]
-    int num_k_tiles = (num_sf_cols + 3) / 4;
-    return static_cast<int64_t>(row / 128) * num_k_tiles * 512 +
-           static_cast<int64_t>(sf_col / 4) * 512 + (row % 32) * 16 + ((row % 128) / 32) * 4 +
-           (sf_col % 4);
-  }
-
-  // MXFP8 quantization of one VEC_SIZE-element access. kMXFP8SFVecSize / VEC_SIZE adjacent
-  // threads (consecutive access ids within the token) cooperate on one 32-element scale group.
-  // Numerics match FlashInfer's mxfp8_quantize (backend="cute-dsl") applied to the bf16/fp16
-  // norm output: scale = ue8m0_ceil(amax * (1 / 448)), q = satfinite_rn(clamp(x * 2^-scale)).
   __device__ __forceinline__ void mxfp8_quant(vec_t<T, VEC_SIZE> const& val, int token_id) {
-    constexpr int kSfVec = details::kMXFP8SFVecSize;
-    constexpr int kThreadsPerSf = kSfVec / VEC_SIZE;
-    static_assert(kSfVec % VEC_SIZE == 0 && kThreadsPerSf <= 32, "Invalid MXFP8 vector size");
-
-    float amax = 0.f;
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-      amax = fmaxf(amax, fabsf(static_cast<float>(reinterpret_cast<T const*>(&val)[i])));
-    }
-    // The kThreadsPerSf lanes of a scale group are lane-aligned (the launcher keeps the block
-    // size a multiple of kThreadsPerSf) and always reach this point together, so the shuffle
-    // mask names exactly the group.
-    constexpr unsigned int kGroupLanes =
-        kThreadsPerSf >= 32 ? 0xffffffffu : ((1u << kThreadsPerSf) - 1u);
-    unsigned int const mask = kGroupLanes << ((threadIdx.x & 31) & ~(kThreadsPerSf - 1));
-#pragma unroll
-    for (int offset = 1; offset < kThreadsPerSf; offset *= 2) {
-      amax = fmaxf(amax, __shfl_xor_sync(mask, amax, offset));
-    }
-
-    constexpr float kInvE4M3Max = 1.0f / details::kFP8E4M3Max;
-    uint32_t sf = float_to_ue8m0_ceil(amax * kInvE4M3Max);
-    // 2^(127 - sf): exact inverse of the UE8M0 scale; 0 for sf == 0.
-    float inv_scale =
-        sf == 0u ? 0.f
-                 : __uint_as_float(static_cast<uint32_t>(max(254 - static_cast<int>(sf), 0)) << 23);
-
-    using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
-    PackedQuantizedType ret;
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; i += 2) {
-      float2 f;
-      f.x = static_cast<float>(reinterpret_cast<T const*>(&val)[i]) * inv_scale;
-      f.y = static_cast<float>(reinterpret_cast<T const*>(&val)[i + 1]) * inv_scale;
-      f.x = fmaxf(fminf(f.x, details::kFP8E4M3Max), -details::kFP8E4M3Max);
-      f.y = fmaxf(fminf(f.y, details::kFP8E4M3Max), -details::kFP8E4M3Max);
-      reinterpret_cast<__nv_fp8x2_storage_t*>(&ret)[i / 2] =
-          __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
-    }
-    reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
-
-    if (m_access_id_in_token % kThreadsPerSf != 0) {
-      return;
-    }
-    // One thread per scale group writes the scale, plus the zero scale columns
-    // [num_sf_cols, round_up(num_sf_cols, 4)) of its own row for the swizzled layout. Rows
-    // [token_num, round_up(token_num, 128)) are left unwritten: a GEMM row only reads its own
-    // scales, so they reach only output rows that are never stored.
-    uint8_t* scale_out = reinterpret_cast<uint8_t*>(m_params.scale_out);
-    int num_sf_cols = m_params.hidden_dim / kSfVec;
-    int sf_col = m_access_id_in_token / kThreadsPerSf;
-    scale_out[mxfp8_sf_offset(token_id, sf_col, num_sf_cols)] = static_cast<uint8_t>(sf);
-    if (m_params.layout != QuantizationSFLayout::SWIZZLED_128x4 || sf_col != num_sf_cols - 1) {
-      return;
-    }
-    int padded_cols = (num_sf_cols + 3) / 4 * 4;
-    for (int col = num_sf_cols; col < padded_cols; ++col) {
-      scale_out[mxfp8_sf_offset(token_id, col, num_sf_cols)] = 0;
-    }
+    utils::mxfp8_quantize_store<T, VEC_SIZE>(
+        reinterpret_cast<T const*>(&val), token_id, m_access_id_in_token * VEC_SIZE,
+        m_params.hidden_dim, m_params.layout, m_params.quant_out, m_params.scale_out);
   }
 
   __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const& residual,

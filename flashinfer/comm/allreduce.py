@@ -685,12 +685,12 @@ def allreduce_fusion(
         * ``kARResidualRMSNormDynamicFP8Quant = 10``
         * ``kARResidualRMSNormOutDynamicFP8Quant = 11``
         * ``kMoEFinalizeARResidualRMSNormFP8Quant = 12`` (MNNVL CuTe DSL only)
-        * ``kARResidualRMSNormMXFP8Quant = 13`` (TRT-LLM only)
-        * ``kARResidualRMSNormOutMXFP8Quant = 14`` (TRT-LLM only)
+        * ``kARResidualRMSNormMXFP8Quant = 13``
+        * ``kARResidualRMSNormOutMXFP8Quant = 14``
 
-        MNNVL supports the standard FP8/NVFP4 quant patterns (2-5) and
-        dynamic FP8 patterns (10-11). Packed group quant and MXFP8 patterns
-        remain TRT-LLM only.
+        MNNVL supports the standard FP8/NVFP4 quant patterns (2-5), dynamic
+        FP8 patterns (10-11) and MXFP8 patterns (13-14). Packed group quant
+        patterns remain TRT-LLM only.
 
         ``kMoEFinalizeARResidualRMSNorm`` is available through TRT-LLM,
         Cake on a TRT-LLM workspace, and the explicit MNNVL CuTe DSL backend.
@@ -1209,6 +1209,14 @@ def allreduce_fusion(
                 MNNVLQuantType.DYNAMIC_FP8,
                 True,
             ),
+            AllReduceFusionPattern.kARResidualRMSNormMXFP8Quant: (
+                MNNVLQuantType.MXFP8,
+                False,
+            ),
+            AllReduceFusionPattern.kARResidualRMSNormOutMXFP8Quant: (
+                MNNVLQuantType.MXFP8,
+                True,
+            ),
         }
         if pattern not in (
             AllReduceFusionPattern.kAllReduce,
@@ -1285,7 +1293,19 @@ def allreduce_fusion(
 
             quant_type, has_norm_out = mnnvl_quant_patterns[pattern]
             is_dynamic_fp8 = quant_type == MNNVLQuantType.DYNAMIC_FP8
-            if is_dynamic_fp8:
+            if quant_type == MNNVLQuantType.MXFP8:
+                _check_mxfp8_fusion_args(
+                    pattern,
+                    input,
+                    residual_in,
+                    residual_out,
+                    rms_gamma,
+                    quant_out,
+                    scale_out,
+                    norm_out,
+                    mnnvl_layout_code,
+                )
+            elif is_dynamic_fp8:
                 if residual_out is None:
                     raise ValueError(
                         "residual_out is required for MNNVL dynamic FP8 patterns"
