@@ -506,7 +506,13 @@ class TuningConfig:
             (absorbing first-launch initialization), then evict L2 so the timed
             replay starts from a cold L2, and give every launch in the graph its
             own input copy. Requires ``use_cuda_graph``; the eviction also
-            requires ``use_cold_l2_cache``.
+            requires ``use_cold_l2_cache``. With ``use_cold_l2_cache`` each
+            sample times a graph of back-to-back invocations, each reading its
+            own copy of the inputs (enough copies to exceed twice the L2), and
+            reports the per-invocation share. A single short invocation is
+            shorter than the GPU timestamp granularity (2.048 us on B200), so
+            isolated samples tie across tactics; the amortized window keeps
+            every invocation's operands cold without that floor.
         tensor_initializers (Tuple[Tuple[int, TensorInitializer]]): Per-input-index
             initializer closures used to synthesize profiling tensors. Each entry
             pairs an input tensor index with the closure that fills that input.
@@ -1545,6 +1551,9 @@ class AutoTuner:
     """
 
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
+    # Upper bound on the input copies one cold-L2 graph-replay sample cycles
+    # through (see ``TuningConfig.use_cold_l2_graph_replay``).
+    _COLD_L2_MAX_REPLAY_LANES = 32
     _instance = None
     _class_lock = threading.Lock()
 
@@ -2917,6 +2926,16 @@ class AutoTuner:
             starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
             ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
             graph = torch.cuda.CUDAGraph() if tuning_config.use_cuda_graph else None
+            # One invocation per sample, unless the op asks for graph replay
+            # over per-launch input copies (amortizes timestamp granularity).
+            lanes = (
+                self._cold_l2_replay_lanes(
+                    input_tensor_batches[-1],
+                    self._get_l2_cache_size_in_bytes(device.index),
+                )
+                if graph is not None and tuning_config.use_cold_l2_graph_replay
+                else [input_tensor_batches[-1]]
+            )
 
             def _run_once(profile_inputs):
                 runner(profile_inputs, tactic=tactic, **kwargs)
@@ -2924,7 +2943,8 @@ class AutoTuner:
             with torch.cuda.stream(stream):
                 if graph is not None:
                     with torch.cuda.graph(graph):
-                        _run_once(input_tensor_batches[-1])
+                        for lane in lanes:
+                            _run_once(lane)
                     # Exercise the captured graph before collecting samples;
                     # every measured replay below is cold independently.
                     graph.replay()
@@ -2956,7 +2976,7 @@ class AutoTuner:
             samples = [
                 start.elapsed_time(end) for start, end in zip(starts, ends, strict=True)
             ]
-            return statistics.median(samples)
+            return statistics.median(samples) / len(lanes)
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int) -> float:
             graph = torch.cuda.CUDAGraph()
@@ -3975,6 +3995,65 @@ class AutoTuner:
         # and aliases (including nested split views). Tensor.clone() can compact
         # gapped views and would measure a different layout from the caller's.
         return [inputs]
+
+    @classmethod
+    def _cold_l2_replay_lanes(
+        cls, inputs: list[Any], l2_cache_size_bytes: int
+    ) -> list[list[Any]]:
+        """Input copies for one cold-L2 graph-replay sample.
+
+        Lane 0 is *inputs* itself. Each further lane copies every distinct CUDA
+        storage the inputs reference and rebuilds the same views on it, so
+        strides, offsets, alignment and aliases match the caller's layout.
+        Enough lanes are made for their storages to exceed twice the L2, so
+        each launch in the replay reads operands no earlier launch touched.
+        Inputs passed through kwargs are shared by all lanes.
+        """
+        storages: dict[int, torch.UntypedStorage] = {}
+
+        def collect(item):
+            if isinstance(item, torch.Tensor):
+                if item.is_cuda:
+                    storage = item.untyped_storage()
+                    storages.setdefault(storage.data_ptr(), storage)
+            elif isinstance(item, (list, tuple)):
+                for sub in item:
+                    collect(sub)
+
+        collect(inputs)
+        lane_bytes = sum(storage.nbytes() for storage in storages.values())
+        if lane_bytes == 0:
+            return [inputs]
+        num_lanes = min(
+            cls._COLD_L2_MAX_REPLAY_LANES,
+            max(1, -(-2 * l2_cache_size_bytes // lane_bytes)),
+        )
+        lanes = [inputs]
+        for _ in range(num_lanes - 1):
+            copies = {}
+            for key, storage in storages.items():
+                copy_ = torch.empty(
+                    storage.nbytes(), dtype=torch.uint8, device=storage.device
+                ).untyped_storage()
+                copy_.copy_(storage)
+                copies[key] = copy_
+
+            def rebuild(item):
+                if isinstance(item, torch.Tensor) and item.is_cuda:
+                    view = torch.empty(0, dtype=item.dtype, device=item.device)
+                    view.set_(
+                        copies[item.untyped_storage().data_ptr()],
+                        item.storage_offset(),
+                        item.size(),
+                        item.stride(),
+                    )
+                    return view
+                if isinstance(item, (list, tuple)):
+                    return type(item)(rebuild(sub) for sub in item)
+                return item
+
+            lanes.append([rebuild(item) for item in inputs])
+        return lanes
 
     def _get_profiling_repeat(self, tuning_config: TuningConfig) -> int:
         profiling_repeat = tuning_config.profiling_repeat

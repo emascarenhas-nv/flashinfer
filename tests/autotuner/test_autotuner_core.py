@@ -1598,6 +1598,82 @@ def test_cold_l2_choose_one_profiles_original_layout(monkeypatch, use_cuda_graph
     torch.testing.assert_close(out, packed + 1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cold_l2_replay_lanes_copy_storages_and_keep_layout():
+    storage = torch.arange(4 * 40, dtype=torch.float32, device="cuda").reshape(4, 40)
+    packed = storage[:, 1:33]
+    left, right = packed.split(16, dim=-1)
+    out = torch.empty(8, device="cuda")
+    inputs = [packed, left, (left, right), out, None, 3]
+    lane_bytes = storage.untyped_storage().nbytes() + out.untyped_storage().nbytes()
+
+    # Twice a 1.5-lane L2 needs three lanes.
+    lanes = AutoTuner._cold_l2_replay_lanes(
+        inputs, l2_cache_size_bytes=lane_bytes * 3 // 2
+    )
+
+    assert len(lanes) == 3
+    assert lanes[0] is inputs
+    pointers = {lane[0].data_ptr() for lane in lanes}
+    assert len(pointers) == 3
+    for lane in lanes[1:]:
+        assert lane[0].stride() == packed.stride()
+        assert lane[0].data_ptr() % 16 == packed.data_ptr() % 16
+        torch.testing.assert_close(lane[0], packed)
+        assert lane[1].data_ptr() == lane[0].data_ptr()
+        assert lane[2][1].data_ptr() == lane[0].data_ptr() + 16 * packed.element_size()
+        assert lane[3].data_ptr() != out.data_ptr()
+        assert lane[4] is None and lane[5] == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cold_l2_replay_lanes_are_capped():
+    x = torch.empty(16, device="cuda")
+    lanes = AutoTuner._cold_l2_replay_lanes([x], l2_cache_size_bytes=1 << 30)
+    assert len(lanes) == AutoTuner._COLD_L2_MAX_REPLAY_LANES
+    # Inputs already larger than twice the L2 need no copies.
+    assert len(AutoTuner._cold_l2_replay_lanes([x], l2_cache_size_bytes=8)) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("graph_replay", [False, True])
+def test_cold_l2_graph_replay_times_per_invocation(monkeypatch, graph_replay):
+    seen = []
+
+    class AddRunner(DummyRunner):
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            seen.append(inputs[0].data_ptr())
+            torch.add(inputs[0], 1, out=inputs[1])
+            return inputs[1]
+
+    tuner = AutoTuner(warmup=1, repeat=3)
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 8192
+    )
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
+    )
+    inputs = [torch.ones(1024, device="cuda"), torch.empty(1024, device="cuda")]
+    config = TuningConfig(
+        use_cuda_graph=True,
+        use_cold_l2_cache=True,
+        use_cold_l2_graph_replay=graph_replay,
+    )
+    elapsed = [0.016]  # ms per timed window
+    monkeypatch.setattr(torch.cuda.Event, "elapsed_time", lambda self, end: elapsed[0])
+
+    latency = tuner._profile_single_kernel(AddRunner((0,)), inputs, 0, config)
+
+    # Each lane holds 8 KiB, so twice an 8 KiB L2 needs two lanes.
+    num_lanes = 2 if graph_replay else 1
+    assert latency == pytest.approx(0.016 / num_lanes)
+    # Warmup and capture saw one distinct buffer per lane.
+    assert len(set(seen)) == num_lanes
+    torch.testing.assert_close(inputs[1], inputs[0] + 1)
+
+
 def test_autotune_context_rejects_invalid_cuda_graph_profile_replays():
     with (
         pytest.raises(ValueError, match="must be at least one"),
