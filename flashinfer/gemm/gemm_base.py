@@ -7063,7 +7063,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             "Supported: torch.bfloat16, torch.float16."
         )
     c_cutlass_dtype = torch_to_cutlass_dtype(out_dtype)
-    _ = sm_major, sm_minor
+    sm100_or_sm103 = (sm_major, sm_minor) in ((10, 0), (10, 3))
 
     class CuteDSLMxfp8GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -7147,10 +7147,23 @@ def _cute_dsl_gemm_mxfp8_runner(
             sf_dtype = cutlass.Float8E8M0FNU
             batch_size = 1
 
-            if split_k_kernel_cls.supports_m(m) and out.is_contiguous():
-                # Untuned low-M execution uses the corresponding base tactic.
-                fallback_split = (
-                    _sm107_low_m_split_k(
+            def fallback_tactic():
+                # Only built when needed, so tuned calls pay no host time for it.
+                if not (split_k_kernel_cls.supports_m(m) and out.is_contiguous()):
+                    return (
+                        _SM100_DEFAULT_MMA_TILER_MN,
+                        _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                        False,
+                        False,
+                        1,
+                    )
+                # Untuned low-M execution uses the corresponding base tactic,
+                # split over K where that fills the GPU better: on SM107, and
+                # on SM100 / SM103 up to M = 16 (at M 17-32 a split measured no
+                # faster on B200 / B300).
+                split_k_slices = 1
+                if low_m_only or (sm100_or_sm103 and m <= 16):
+                    split_k_slices = _sm107_low_m_split_k(
                         m,
                         n,
                         real_k,
@@ -7158,27 +7171,25 @@ def _cute_dsl_gemm_mxfp8_runner(
                         split_k_kernel_cls,
                         get_device_sm_count(a.device),
                     )
-                    if low_m_only
-                    else 1
-                )
-                fallback_tactic = (
+                if (
+                    split_k_slices > 1
+                    and warp_splitk_supports is not None
+                    and (m <= 8 or real_k < 4096)
+                    and warp_splitk_supports(inputs)
+                ):
+                    # get_valid_tactics offers no cluster split-K here: split-K
+                    # is left to the warp split-K runner.
+                    split_k_slices = 1
+                return (
                     split_k_kernel_cls.mma_tiler_mn_for_m(m),
                     (1, 1),
                     True,
                     False,
-                    fallback_split,
-                )
-            else:
-                fallback_tactic = (
-                    _SM100_DEFAULT_MMA_TILER_MN,
-                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
-                    False,
-                    False,
-                    1,
+                    split_k_slices,
                 )
 
             if tactic is None or tactic == -1:
-                tactic = fallback_tactic
+                tactic = fallback_tactic()
 
             (
                 mma_tiler_mn,
@@ -7214,7 +7225,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                     # that the split-K kernel cannot implement. Keep the runner's
                     # fallback contract instead of turning a stale optimization
                     # into a serving failure.
-                    tactic = fallback_tactic
+                    tactic = fallback_tactic()
                     (
                         mma_tiler_mn,
                         cluster_shape_mn,
@@ -7222,7 +7233,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                         use_prefetch,
                         split_k_slices,
                     ) = tactic
-                    is_split_k = False
+                    is_split_k = split_k_slices > 1  # the fallback may split K
 
             # Re-check whatever is about to launch against the narrow-tile
             # envelope (Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok):
@@ -7233,7 +7244,7 @@ def _cute_dsl_gemm_mxfp8_runner(
             if not Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok(
                 mma_tiler_mn[1], m if swap_ab else n
             ):
-                tactic = fallback_tactic
+                tactic = fallback_tactic()
                 (
                     mma_tiler_mn,
                     cluster_shape_mn,
@@ -7241,7 +7252,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                     use_prefetch,
                     split_k_slices,
                 ) = tactic
-                is_split_k = False
+                is_split_k = split_k_slices > 1  # the fallback may split K
 
             if swap_ab:
                 kernel_m, kernel_n = n, m

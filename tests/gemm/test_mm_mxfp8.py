@@ -13,7 +13,7 @@ from flashinfer.autotuner import AutoTuner
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.gemm import gemm_base
 from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, get_device_sm_count
 
 
 _MIN_COS_SIM = 0.98
@@ -343,6 +343,113 @@ def test_mm_mxfp8_cute_dsl_low_m(m, k, auto_tuning):
     )
 
 
+def _skip_unless_sm100_or_sm103():
+    device = torch.device("cuda")
+    if get_compute_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("the untuned low-M split-K rule tested here is SM100 / SM103's")
+    # The expected split-K slices hold for 128 to 207 SMs (B200 and B300 have 148).
+    if not 128 <= get_device_sm_count(device) < 208:
+        pytest.skip("expected split-K slices assume a B200 / B300-sized GPU")
+
+
+def _record_cute_dsl_mxfp8_kernels(monkeypatch):
+    """(kernel class, split-K slices) of every block-scaled kernel launch the
+    cute-dsl mm_mxfp8 runner makes from now on."""
+    launched = []
+    compile_gemm = gemm_base._compile_block_scaled_gemm
+
+    def recording_compile(cache, cache_key, make_kernel, *args, **kwargs):
+        kernel = make_kernel()
+        launched.append((type(kernel).__name__, getattr(kernel, "split_k_slices", 1)))
+        return compile_gemm(cache, cache_key, make_kernel, *args, **kwargs)
+
+    monkeypatch.setattr(gemm_base, "_compile_block_scaled_gemm", recording_compile)
+    return launched
+
+
+@pytest.mark.parametrize(
+    "m,n,k,split_k_slices",
+    [
+        # K > 5120, so no warp split-K. 20 N tiles x 4 slices fit in 3/4 of the SMs.
+        (1, 2560, 6144, 4),
+        (16, 2560, 6144, 4),
+        # 39 N tiles: 4 slices would take 156 CTAs, 2 take 78.
+        (4, 4992, 6144, 2),
+        # 96 N tiles: even 2 slices take more than 3/4 of the SMs.
+        (1, 12288, 6144, 1),
+        # Warp split-K can run but is not the default (N / 16 > SM count). At
+        # M > 8 and K >= 4096, get_valid_tactics offers cluster split-K.
+        (16, 6144, 4096, 2),
+        # At M <= 8, or K < 4096, split-K is left to the warp split-K runner.
+        (1, 6144, 4096, 1),
+        (16, 6144, 2048, 1),
+        # M 17-32 keeps the unsplit 128x32 tile.
+        (24, 2560, 6144, 1),
+    ],
+)
+def test_mm_mxfp8_cute_dsl_untuned_low_m_split_k(m, n, k, split_k_slices, monkeypatch):
+    """Untuned, the SM100 / SM103 cute-dsl default splits K up to M = 16 where
+    get_valid_tactics offers cluster split-K and a split fills the GPU better."""
+    _skip_if_unsupported("cute-dsl")
+    _skip_unless_sm100_or_sm103()
+    from flashinfer.cute_dsl.availability import is_cute_dsl_experimental_available
+
+    if k <= 5120 and (m <= 8 or k < 4096) and not is_cute_dsl_experimental_available():
+        pytest.skip("the warp split-K runner needs cutlass.experimental")
+    launched = _record_cute_dsl_mxfp8_kernels(monkeypatch)
+    # A cached winner would replace the untuned default runner and tactic.
+    AutoTuner.get().clear_cache()
+    _run_mm_mxfp8(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        torch.bfloat16,
+        "cute-dsl",
+        auto_tuning=False,
+        provide_out=True,
+    )
+    kernel = (
+        "Sm100BlockScaledSplitKGemmKernel"
+        if split_k_slices > 1
+        else "Sm100BlockScaledPersistentDenseGemmKernel"
+    )
+    assert launched == [(kernel, split_k_slices)], launched
+
+
+def test_mm_mxfp8_cute_dsl_split_k_fallback(monkeypatch):
+    """A stale tactic is replaced by the untuned default; where that splits K,
+    the split-K kernel must run it."""
+    _skip_if_unsupported("cute-dsl")
+    _skip_unless_sm100_or_sm103()
+    m, n, k = 12, 2560, 6144  # the untuned default splits K 4 ways
+    # Split-K tactic tuned for the M <= 8 bucket: its 128x8 tile cannot run M = 12.
+    stale_tactic = ((128, 8), (1, 1), True, False, 2)
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
+    )
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    launched = _record_cute_dsl_mxfp8_kernels(monkeypatch)
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(major, minor, True, torch.bfloat16)
+    runner.forward(
+        [
+            input_mxfp8,
+            weight_mxfp8.T,
+            input_scale,
+            weight_scale,
+            torch.bfloat16,
+            out,
+            None,
+        ],
+        tactic=stale_tactic,
+    )
+    assert launched == [("Sm100BlockScaledSplitKGemmKernel", 4)], launched
+    _assert_cosine_similarity(torch.mm(input, weight.T), out)
+
+
 @pytest.mark.parametrize(
     "a_scale,b_scale,expected",
     [
@@ -428,7 +535,17 @@ void pdl_delayed_producer(at::Tensor w_out, at::Tensor w_in, at::Tensor s_out,
 
 
 @pytest.mark.parametrize("auto_tuning", [False, True])
-@pytest.mark.parametrize("m,n,k", [(1, 1152, 1536), (16, 2304, 2048), (32, 256, 2048)])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 1152, 1536),
+        (16, 2304, 2048),
+        (32, 256, 2048),
+        # Untuned on SM100 / SM103, these run cluster split-K (4 and 2 slices).
+        (1, 2560, 6144),
+        (16, 6144, 4096),
+    ],
+)
 def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
     """The cute-dsl GEMM launches with PDL; it must not read the weight or its
     scales before the kernel that writes them has finished."""
