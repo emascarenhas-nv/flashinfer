@@ -7007,6 +7007,7 @@ def _check_cute_dsl_availability():
         raise ValueError("CuTe DSL is not available.")
 
 
+@functools.lru_cache(maxsize=1024)
 def _sm107_low_m_split_k(
     m: int, n: int, real_k: int, ab_dtype, split_k_kernel_cls, sm_count: int
 ) -> int:
@@ -7159,10 +7160,20 @@ def _cute_dsl_gemm_mxfp8_runner(
                     )
                 # Untuned low-M execution uses the corresponding base tactic,
                 # split over K where that fills the GPU better: on SM107, and
-                # on SM100 / SM103 up to M = 16 (at M 17-32 a split measured no
-                # faster on B200 / B300).
+                # on SM100 / SM103 up to M = 16 (at M = 24 and 32 a split was no
+                # faster at the median on B200 / B300 and slowed some shapes by
+                # up to 16%). As in get_valid_tactics, not where the
+                # warp split-K runner serves M <= 8 or K < 4096. Its check is not
+                # repeated here: _cute_dsl_mxfp8_runners passes
+                # warp_splitk_supports only for inputs it can run at M <= 16.
                 split_k_slices = 1
-                if low_m_only or (sm100_or_sm103 and m <= 16):
+                if low_m_only or (
+                    sm100_or_sm103
+                    and m <= 16
+                    and not (
+                        warp_splitk_supports is not None and (m <= 8 or real_k < 4096)
+                    )
+                ):
                     split_k_slices = _sm107_low_m_split_k(
                         m,
                         n,
@@ -7171,15 +7182,6 @@ def _cute_dsl_gemm_mxfp8_runner(
                         split_k_kernel_cls,
                         get_device_sm_count(a.device),
                     )
-                if (
-                    split_k_slices > 1
-                    and warp_splitk_supports is not None
-                    and (m <= 8 or real_k < 4096)
-                    and warp_splitk_supports(inputs)
-                ):
-                    # get_valid_tactics offers no cluster split-K here: split-K
-                    # is left to the warp split-K runner.
-                    split_k_slices = 1
                 return (
                     split_k_kernel_cls.mma_tiler_mn_for_m(m),
                     (1, 1),

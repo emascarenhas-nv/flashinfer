@@ -356,7 +356,7 @@ def _record_cute_dsl_mxfp8_kernels(monkeypatch):
     """(kernel class, split-K slices) of every block-scaled kernel launch the
     cute-dsl mm_mxfp8 runner makes from now on."""
     launched = []
-    compile_gemm = gemm_base._compile_block_scaled_gemm
+    compile_gemm = gemm_base._compile_block_scaled_gemm  # pyright: ignore[reportPrivateUsage]
 
     def recording_compile(cache, cache_key, make_kernel, *args, **kwargs):
         kernel = make_kernel()
@@ -415,39 +415,6 @@ def test_mm_mxfp8_cute_dsl_untuned_low_m_split_k(m, n, k, split_k_slices, monkey
         else "Sm100BlockScaledPersistentDenseGemmKernel"
     )
     assert launched == [(kernel, split_k_slices)], launched
-
-
-def test_mm_mxfp8_cute_dsl_split_k_fallback(monkeypatch):
-    """A stale tactic is replaced by the untuned default; where that splits K,
-    the split-K kernel must run it."""
-    _skip_if_unsupported("cute-dsl")
-    _skip_unless_sm100_or_sm103()
-    m, n, k = 12, 2560, 6144  # the untuned default splits K 4 ways
-    # Split-K tactic tuned for the M <= 8 bucket: its 128x8 tile cannot run M = 12.
-    stale_tactic = ((128, 8), (1, 1), True, False, 2)
-    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
-    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
-        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
-    )
-    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
-    launched = _record_cute_dsl_mxfp8_kernels(monkeypatch)
-    major, minor = get_compute_capability(torch.device("cuda"))
-    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(major, minor, True, torch.bfloat16)
-    runner.forward(
-        [
-            input_mxfp8,
-            weight_mxfp8.T,
-            input_scale,
-            weight_scale,
-            torch.bfloat16,
-            out,
-            None,
-        ],
-        tactic=stale_tactic,
-    )
-    assert launched == [("Sm100BlockScaledSplitKGemmKernel", 4)], launched
-    _assert_cosine_similarity(torch.mm(input, weight.T), out)
 
 
 @pytest.mark.parametrize(
@@ -709,7 +676,15 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "m,n,k", [(4, 6144, 1024), (129, 256, 4096), (2048, 256, 4096)]
+    "m,n,k",
+    [
+        (4, 6144, 1024),
+        (129, 256, 4096),
+        (2048, 256, 4096),
+        # Untuned on SM100 / SM103, these run cluster split-K (4 and 2 slices).
+        (1, 2560, 6144),
+        (16, 6144, 4096),
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mm_mxfp8_cute_dsl_quantize_pdl_cuda_graph(m, n, k, dtype):
@@ -870,6 +845,58 @@ def test_mm_mxfp8_cute_dsl_stale_narrow_tile_tactic_falls_back(m, tile_n):
     )
     torch.cuda.synchronize()
 
+    _assert_cosine_similarity(torch.mm(input, weight.T), out)
+
+
+@pytest.mark.parametrize(
+    "tactic",
+    [
+        # Split-K tactic tuned for the M <= 8 bucket: the runner takes split-K
+        # only with M's own tile (128x16 at M = 12), so it is stale here.
+        ((128, 8), (1, 1), True, False, 2),
+        # Narrow tile without the A/B swap: kernel N = 2560 fails the
+        # narrow-tile re-check.
+        ((128, 16), (1, 1), False, False, 1),
+    ],
+)
+def test_mm_mxfp8_cute_dsl_replaced_tactic_runs_split_k(tactic, monkeypatch):
+    """A tactic the runner replaces runs the untuned default; where that splits
+    K, it must launch the split-K kernel."""
+    _skip_if_unsupported("cute-dsl")
+    _skip_unless_sm100_or_sm103()
+
+    m, n, k = 12, 2560, 6144  # the untuned default splits K 4 ways
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input,
+        weight,
+        SfLayout.layout_128x4,
+        SfLayout.layout_128x4,
+        "cute-dsl",
+    )
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+    launched = _record_cute_dsl_mxfp8_kernels(monkeypatch)
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
+        major, minor, True, torch.bfloat16
+    )
+    runner(
+        [
+            input_mxfp8,
+            weight_mxfp8.T,
+            input_scale,
+            weight_scale,
+            torch.bfloat16,
+            out,
+            workspace,
+        ],
+        tactic=tactic,
+    )
+
+    assert launched == [("Sm100BlockScaledSplitKGemmKernel", 4)], launched
     _assert_cosine_similarity(torch.mm(input, weight.T), out)
 
 
