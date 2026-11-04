@@ -7008,7 +7008,7 @@ def _check_cute_dsl_availability():
 
 
 @functools.lru_cache(maxsize=1024)
-def _sm107_low_m_split_k(
+def _sm10x_low_m_split_k(
     m: int, n: int, real_k: int, ab_dtype, split_k_kernel_cls, sm_count: int
 ) -> int:
     """Most split-K slices that fill <= 3/4 of the SMs with >= 8 K blocks per slice.
@@ -7174,7 +7174,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                         warp_splitk_supports is not None and (m <= 8 or real_k < 4096)
                     )
                 ):
-                    split_k_slices = _sm107_low_m_split_k(
+                    split_k_slices = _sm10x_low_m_split_k(
                         m,
                         n,
                         real_k,
